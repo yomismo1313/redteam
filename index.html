@@ -1,3 +1,44 @@
-git mv screenshots pivoting
-git commit -m "Rename screenshots to pivoting"
-git push
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Pivoting Gallery</title>
+  <style>
+    body {
+      font-family: Arial;
+      background: #111;
+      color: white;
+      text-align: center;
+    }
+
+    .gallery {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+      gap: 10px;
+      padding: 20px;
+    }
+
+    .gallery img {
+      width: 100%;
+      border-radius: 10px;
+      transition: 0.3s;
+    }
+
+    .gallery img:hover {
+      transform: scale(1.05);
+    }
+  </style>
+</head>
+
+<body>
+
+<h1>📁 Pivoting Gallery</h1>
+
+<div class="gallery">
+  <img src="pivoting/img1.png">
+  <img src="pivoting/img2.png">
+  <img src="pivoting/img3.png">
+</div>
+
+</body>
+</html>
