@@ -255,4 +255,4 @@ sudo nc -lnv 4444
 
 ## Licencia
 
-Uso educativo. Consulta la licencia del repositorio para más detalles.
+Uso educativo y entorno controlado
